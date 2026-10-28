@@ -24,9 +24,10 @@ and the queue is drained through the declared requests whenever the device is
 already online: on any WiFi connection (the selection/auto-connect completion
 in `WifiSelectionActivity`), when the File Transfer web server comes up in Join
 Network mode, or on the way into sleep. Delivery is at-least-once and in order;
-every queued line carries a unique `id` (a per-boot nonce plus a counter, so it
-never repeats across queued events or reboots) — dedupe on `{event.id}`
-server-side if it matters.
+every queued line carries an `id` (a per-boot random nonce plus a counter, so
+queued IDs do not repeat within a boot; cross-boot uniqueness is probabilistic)
+— dedupe retries of the same queued event on `{event.id}` server-side if it
+matters.
 
 Event subscriptions need a plugin folder name of at most 23 bytes, with the
 full folder path (root included) within 63 bytes; a plugin past either limit
@@ -35,7 +36,15 @@ is logged and not subscribed.
 `sleep.enter` gets special timing: it exists to act before the chip powers
 down (a fresh sleep image, a pre-sleep progress push), so the sleep path
 actively brings WiFi up to deliver it at sleep entry instead of waiting for
-the next online session. See "sleep.enter delivery" below.
+the next online session. On Xteink X4, a subscribed `sleep.enter` handler also
+enables a maintenance wake every 15 minutes when `CUSTOM` is selected, or
+`COVER_CUSTOM` is selected while not sleeping from a reader, and battery is at
+least 20%. That wake runs the normal sleep-entry drain and returns to deep
+sleep. Handlers may therefore receive `sleep.enter` repeatedly while the device
+remains asleep. Each occurrence is a new event; handlers should tolerate
+repeated actions, while `{event.id}` can deduplicate retries of one queued
+occurrence.
+See "sleep.enter delivery" below.
 
 ## The event whitelist
 
@@ -163,7 +172,13 @@ just sleeps with the previous image, and the queued events retry on the next
 drain like any other (at-least-once; a handler whose action only made sense for
 that particular sleep should tolerate or ignore the late retry, e.g. by checking
 `{event.ts}`). Other events already queued for the same plugin (`reader.exit` and
-friends) ride along in the sleep-time drain.
+friends) ride along in the sleep-time drain. On X4, a timer is armed for the
+next 15-minute maintenance wake when a `sleep.enter` subscriber exists, the
+sleep uses `CUSTOM` or `COVER_CUSTOM` while not sleeping from a reader, it does
+not use Quick Resume, and battery is at least 20%. If
+battery falls below 20% by the time the timer wakes, `sleep.enter` is still
+emitted, but the device will not bring WiFi up to deliver queued events, and
+another timer is not armed.
 
 Auth reuses the catalog vocabulary from the same `device.json`: `{token}` is
 read from the declared token file, and on a 401/403 a `"password"`-type auth

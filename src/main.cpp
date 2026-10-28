@@ -130,14 +130,16 @@ constexpr uint32_t SILENT_REBOOT_TARGET_SETTINGS = 2;
 constexpr uint32_t SILENT_REBOOT_TARGET_JOIN_NETWORK = 3;
 constexpr uint32_t SILENT_REBOOT_TARGET_MAX = SILENT_REBOOT_TARGET_JOIN_NETWORK;
 constexpr uint32_t SILENT_REBOOT_LIGHT_ON = 1U << 0;
+constexpr uint64_t SLEEP_PLUGIN_REFRESH_INTERVAL_US = 15ULL * 60 * 1000 * 1000;
+constexpr uint16_t SLEEP_PLUGIN_REFRESH_MIN_BATTERY_PERCENT = 20;
 
-// How the device is coming back to life, resolved once at boot. Both resume
-// flows suppress the splash and leave the panel holding its pre-boot frame; a
-// plain boot shows the splash. See setup() for the resolution.
+// How the device is coming back to life, resolved once at boot. Resume paths
+// suppress the splash and retain the panel frame; a plain boot shows the splash.
 enum class BootResume : uint8_t {
-  Splash,          // cold boot, flash, panic, or plain reboot
-  Silent,          // heap-defrag ESP.restart() (RTC flag; lost on power loss)
-  SplashlessWake,  // wake from deep sleep with the splash suppressed by the SD flag
+  Splash,            // cold boot, flash, panic, or plain reboot
+  Silent,            // heap-defrag ESP.restart() (RTC flag; lost on power loss)
+  SplashlessWake,    // wake from deep sleep with the splash suppressed by the SD flag
+  TimerMaintenance,  // scheduled plugin refresh; update the sleep screen and return to sleep
 };
 
 // Latched true once enterDeepSleep() commits to sleeping, before it tears down
@@ -401,7 +403,7 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
   // sleep.enter: reader.session is queued while reading and delivered on this
   // same sleep, and a progress-sync plugin usually subscribes to it alone.
   if (!pluginevents::wantsConnectAny()) return;
-  if (powerManager.getBatteryPercentage() < 20) return;
+  if (powerManager.getBatteryPercentage() < SLEEP_PLUGIN_REFRESH_MIN_BATTERY_PERCENT) return;
   // Sleep can be the first WiFi use since boot or deep-sleep wake.
   WIFI_STORE.loadFromFile();
   const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
@@ -459,9 +461,9 @@ static bool holdSleepWhileUsbPowered() {
 #endif
 
 // Enter deep sleep mode
-void enterDeepSleep(bool fromTimeout = false) {
+void enterDeepSleep(bool fromTimeout = false, bool preserveSleepOrigin = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  if (!preserveSleepOrigin) APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   // Sleep may end in a power-off (battery death, latch); persist the clock
   // floor now so a later cold boot resumes from it.
@@ -508,12 +510,22 @@ void enterDeepSleep(bool fromTimeout = false) {
   const bool wakeOnHeldButton = false;
 #endif
 
+  const bool customSleepImageVisible =
+      SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM ||
+      (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM && !APP_STATE.lastSleepFromReader);
+  const bool schedulePluginRefresh = gpio.isXteinkDevice() && !gpio.deviceIsX3() && !isQuickResumeSleep &&
+                                     customSleepImageVisible &&
+                                     pluginevents::anySubscriber(pluginevents::Event::SleepEnter) &&
+                                     powerManager.getBatteryPercentage() >= SLEEP_PLUGIN_REFRESH_MIN_BATTERY_PERCENT;
+  const uint64_t timerWakeUs = schedulePluginRefresh ? SLEEP_PLUGIN_REFRESH_INTERVAL_US : 0;
+  if (schedulePluginRefresh) LOG_DBG("SLP", "Scheduled plugin refresh in 15 minutes");
+
   halTiltSensor.deepSleep();
   display.deepSleep();
   Storage.prepareForDeepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 
-  powerManager.startDeepSleep(gpio, wakeOnHeldButton);
+  powerManager.startDeepSleep(gpio, wakeOnHeldButton, timerWakeUs);
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -631,6 +643,11 @@ void setup() {
   // We need 6 open files concurrently when parsing a new chapter
   if (!Storage.begin()) {
     LOG_ERR("MAIN", "SD card initialization failed");
+    if (wakeupReason == HalGPIO::WakeupReason::Timer) {
+      LOG_ERR("SLP", "Scheduled refresh could not mount SD; powering off");
+      powerManager.startDeepSleep(gpio);
+      return;
+    }
     setupDisplayAndFonts(isSilentReboot);
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
@@ -689,7 +706,8 @@ void setup() {
   // reboots replay the live state captured at restart, so they neither go dark
   // nor light up against the user's wake preference.
   const bool restoreLightOn =
-      isSilentReboot ? silentRebootLightOn : (SETTINGS.frontlightOn != 0 && SETTINGS.frontlightRestoreOnWake != 0);
+      wakeupReason != HalGPIO::WakeupReason::Timer &&
+      (isSilentReboot ? silentRebootLightOn : (SETTINGS.frontlightOn != 0 && SETTINGS.frontlightRestoreOnWake != 0));
   Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
 
   switch (wakeupReason) {
@@ -725,8 +743,11 @@ void setup() {
 #endif
     case HalGPIO::WakeupReason::AfterFlash:
       // After flashing, just proceed to boot
+      break;
+    case HalGPIO::WakeupReason::Timer:
+      // Refresh the sleep image without showing the normal boot UI.
+      break;
     case HalGPIO::WakeupReason::Other:
-    default:
       break;
   }
 
@@ -738,9 +759,10 @@ void setup() {
   // retained frame and input dispatches against a visible UI.
   // Only a verified deep-sleep wake may use the one-shot persisted flag.
   // Otherwise a stale flag could suppress the splash on a cold boot.
-  const BootResume resume = isSilentReboot         ? BootResume::Silent
-                            : isPersistedSleepWake ? BootResume::SplashlessWake
-                                                   : BootResume::Splash;
+  const BootResume resume = isSilentReboot                                 ? BootResume::Silent
+                            : wakeupReason == HalGPIO::WakeupReason::Timer ? BootResume::TimerMaintenance
+                            : isPersistedSleepWake                         ? BootResume::SplashlessWake
+                                                                           : BootResume::Splash;
   bool allowFastInitialReaderRefresh = false;
   bool needsWakeRefresh = false;
 
@@ -772,6 +794,10 @@ void setup() {
     case BootResume::Splash:
       activityManager.goToBoot();
       break;
+    case BootResume::TimerMaintenance: {
+      enterDeepSleep(/*fromTimeout=*/false, /*preserveSleepOrigin=*/true);
+      return;
+    }
   }
 
   // Output polarity is resolved per render by ActivityManager (night mode

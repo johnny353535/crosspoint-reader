@@ -81,7 +81,11 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   xSemaphoreGive(modeMutex);
 }
 
-void HalPowerManager::startDeepSleep(HalGPIO& gpio, const bool wakeOnHeldButton) const {
+void HalPowerManager::startDeepSleep(HalGPIO& gpio, const bool wakeOnHeldButton, const uint64_t timerWakeUs) const {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  const bool timerWakeArmed = timerWakeUs > 0 && esp_sleep_enable_timer_wakeup(timerWakeUs) == ESP_OK;
+  if (timerWakeUs > 0 && !timerWakeArmed) LOG_ERR("PWR", "Failed to arm deep-sleep timer");
+
 #if FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_PICCO
   // The frontlight driver and touch share I2C; turn the light off before touch
   // releases the bus. On Picco this also puts the TMA525C to sleep.
@@ -98,14 +102,16 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio, const bool wakeOnHeldButton)
 
 #if !SOC_PM_SUPPORT_EXT1_WAKEUP
   if (gpio.isXteinkDevice()) {
-    // GPIO13 gates the battery MOSFET on both Xteink C3 boards; driving it low
-    // is the battery power-off (the SDK wake source still handles USB power).
+    // X4 GPIO13 is the battery latch; X3 GPIO13 powers the SD card. Keep only
+    // X4's latch high for scheduled wakes. Otherwise this is the battery power-off
+    // (the SDK wake source still handles USB power).
+    const bool keepX4PoweredForTimer = timerWakeArmed && !gpio.deviceIsX3();
     // Release any surviving pad hold first: hold_en survives deep sleep via
     // the SDK's deepSleep() (esp_sleep_config_gpio_isolate +
     // gpio_deep_sleep_hold_en), and a held pad silently ignores the drive.
     gpio_hold_dis(XTEINK_C3_GPIO13);
     gpio_set_direction(XTEINK_C3_GPIO13, GPIO_MODE_OUTPUT);
-    gpio_set_level(XTEINK_C3_GPIO13, 0);
+    gpio_set_level(XTEINK_C3_GPIO13, keepX4PoweredForTimer ? 1 : 0);
     gpio_hold_en(XTEINK_C3_GPIO13);
   }
 #endif
